@@ -63,12 +63,23 @@ STADIA_WIDTH = 1200
 STADIA_HEIGHT = 675
 STADIA_SCALE = "@2x"
 
-# etwas Rand um die Messroute
-MAP_PADDING = 0.00015
+# ------------------------------------------------------------
+# Karten-Skalierung
+# ------------------------------------------------------------
 
-# Karten-Zoom
-MIN_ZOOM = 14
-MAX_ZOOM = 18
+# Zusätzlicher Rand um die tatsächliche Route.
+# 0.15 = 15 % Rand
+ROUTE_PADDING = 0.02
+
+# Zusätzlich vom automatisch berechneten Zoom herauszoomen.
+# 0 = automatische Skalierung
+# 1 = etwas weiter
+# 2 = deutlich weiter
+# 3 = sehr weit
+ZOOM_OUT = 0
+
+MIN_ZOOM = 15
+MAX_ZOOM = 100
 
 # KML
 LABEL_KML_CELL_SITES = True
@@ -704,110 +715,76 @@ def read_kml_file(path):
 # KARTENBEREICH
 # ============================================================
 
-def calculate_map_bounds(clf, kml=None, padding_ratio=0.03):
-    """
-    Berechnet den Kartenausschnitt ausschließlich aus den
-    tatsächlichen Mess-/GPS-Punkten.
+def calculate_map_bounds(clf, kml=None, padding_ratio=ROUTE_PADDING):
 
-    Basisstationen werden bewusst NICHT berücksichtigt.
-    """
-
-    # Nur echte GPS-Messpunkte aus der CLF
-    valid = clf[clf["has_position"]].copy()
+    valid = clf[
+        clf["has_position"]
+        & clf["latitude"].notna()
+        & clf["longitude"].notna()
+    ].copy()
 
     if valid.empty:
-        raise ValueError("Keine gültigen GPS-Messpunkte in der CLF-Datei gefunden.")
+        raise ValueError(
+            "Keine gültigen GPS-Messpunkte in der CLF-Datei gefunden."
+        )
 
-    lats = valid["latitude"].tolist()
-    lons = valid["longitude"].tolist()
-
-    # Falls eine KML vorhanden ist:
-    # nur deren tatsächliche GPS-Route zusätzlich berücksichtigen,
-    # NICHT die Cell Sites.
-    if kml:
-        for lat, lon in kml.get("route", []):
-            lats.append(lat)
-            lons.append(lon)
-
-    min_lat = min(lats)
-    max_lat = max(lats)
-    min_lon = min(lons)
-    max_lon = max(lons)
+    min_lat = valid["latitude"].min()
+    max_lat = valid["latitude"].max()
+    min_lon = valid["longitude"].min()
+    max_lon = valid["longitude"].max()
 
     lat_range = max_lat - min_lat
     lon_range = max_lon - min_lon
 
-    # 3 % Rand um die tatsächlichen Messdaten
-    lat_padding = max(lat_range * padding_ratio, 0.00005)
-    lon_padding = max(lon_range * padding_ratio, 0.00005)
+    if lat_range <= 0:
+        lat_range = 0.001
 
-    return (
-        min_lat - lat_padding,
-        max_lat + lat_padding,
-        min_lon - lon_padding,
-        max_lon + lon_padding,
-    )
+    if lon_range <= 0:
+        lon_range = 0.001
 
-def calculate_zoom(
-    min_lat,
-    max_lat,
-    min_lon,
-    max_lon,
-    width=STADIA_WIDTH,
-    height=STADIA_HEIGHT,
-):
-    """
-    Berechnet die maximale Stadia-Zoomstufe, bei der
-    die komplette Bounding Box in den 16:9-Viewport passt.
-    """
+    min_lat -= lat_range * padding_ratio
+    max_lat += lat_range * padding_ratio
+    min_lon -= lon_range * padding_ratio
+    max_lon += lon_range * padding_ratio
 
+    return min_lat, max_lat, min_lon, max_lon
+    
+def calculate_zoom(min_lat, max_lat, min_lon, max_lon,
+                   width=STADIA_WIDTH, height=STADIA_HEIGHT):
+
+    lat_range = max_lat - min_lat
     lon_range = max_lon - min_lon
 
-    lat1 = math.radians(
-        max(-85.05112878, min(85.05112878, min_lat))
-    )
+    if lat_range <= 0:
+        lat_range = 0.001
 
-    lat2 = math.radians(
-        max(-85.05112878, min(85.05112878, max_lat))
-    )
-
-    # Horizontale Mercator-Spanne
     if lon_range <= 0:
-        zoom_lon = MAX_ZOOM
-    else:
-        zoom_lon = math.log2(
-            360.0 * width /
-            (256.0 * lon_range)
-        )
+        lon_range = 0.001
 
-    # Vertikale Mercator-Spanne
-    y1 = math.log(
-        math.tan(math.pi / 4 + lat1 / 2)
+    # Web-Mercator-Korrektur für Breitengrad
+    center_lat = (min_lat + max_lat) / 2
+    lat_rad = math.radians(center_lat)
+
+    # Effektive Längenausdehnung auf der Karte
+    lon_range_corrected = lon_range * math.cos(lat_rad)
+
+    # Pixel pro Welt bei Zoom 0
+    world_width = 256
+
+    zoom_lon = math.log2(
+        width / world_width / lon_range_corrected
     )
 
-    y2 = math.log(
-        math.tan(math.pi / 4 + lat2 / 2)
+    zoom_lat = math.log2(
+        height / world_width / lat_range
     )
 
-    y_range = abs(y2 - y1)
+    zoom = min(zoom_lon, zoom_lat)
 
-    if y_range <= 0:
-        zoom_lat = MAX_ZOOM
-    else:
-        zoom_lat = math.log2(
-            2 * math.pi * height /
-            (256.0 * y_range)
-        )
+    # Bewusst mehrere Zoomstufen herausgehen
+    zoom = int(math.floor(zoom)) - ZOOM_OUT
 
-    zoom = min(
-        zoom_lon,
-        zoom_lat
-    )
-
-    return max(
-        MIN_ZOOM,
-        min(MAX_ZOOM, int(math.floor(zoom)))
-    )
+    return max(MIN_ZOOM, min(MAX_ZOOM, zoom))
 
 def calculate_viewport_bounds(
     center_lat,
@@ -1154,30 +1131,30 @@ def plot_route(
     )
 
     # KML Route
-    route = kml.get(
-        "route",
-        []
-    )
+    # route = kml.get(
+    #     "route",
+    #     []
+    # )
 
-    if route:
+    # if route:
 
-        route_lats = [
-            x[0] for x in route
-        ]
+    #     route_lats = [
+    #         x[0] for x in route
+    #     ]
 
-        route_lons = [
-            x[1] for x in route
-        ]
+    #     route_lons = [
+    #         x[1] for x in route
+    #     ]
 
-        ax.plot(
-            route_lons,
-            route_lats,
-            linewidth=1.2,
-            color="yellow",
-            alpha=0.85,
-            zorder=4,
-            label="KML GPS-Route",
-        )
+    #     ax.plot(
+    #         route_lons,
+    #         route_lats,
+    #         linewidth=1.2,
+    #         color="yellow",
+    #         alpha=0.85,
+    #         zorder=4,
+    #         label="KML GPS-Route",
+    #     )
 
     # Start / Ende
     if not valid.empty:
@@ -1194,7 +1171,7 @@ def plot_route(
             edgecolor="white",
             linewidth=1.5,
             zorder=10,
-            label="Start",
+            # label="Start",
         )
 
         ax.scatter(
@@ -1206,16 +1183,16 @@ def plot_route(
             edgecolor="white",
             linewidth=1.5,
             zorder=10,
-            label="Ende",
+            # label="Ende",
         )
 
-    ax.set_title(
-        "NetMonitor – GPS Route"
-    )
+    # ax.set_title(
+    #     "NetMonitor – GPS Route"
+    # )
 
-    ax.legend(
-        loc="best"
-    )
+    # ax.legend(
+    #     loc="best"
+    # )
 
     fig.tight_layout()
 
@@ -1268,7 +1245,7 @@ def plot_signal_map(
             c=data["signal_dbm"],
             cmap=signal_color_map(),
             norm=norm,
-            s=22,
+            s=10,
             alpha=0.9,
             edgecolors="none",
             zorder=5,
@@ -1281,7 +1258,7 @@ def plot_signal_map(
         )
 
         cbar.set_label(
-            "Signalstärke [dBm]"
+            "Signal strength [dBm]"
         )
 
     # --------------------------------------------------------
@@ -1306,31 +1283,31 @@ def plot_signal_map(
             zorder=10,
         )
 
-        if LABEL_KML_CELL_SITES:
+        # if LABEL_KML_CELL_SITES:
 
-            for site in sites:
+        #     for site in sites:
 
-                ax.annotate(
-                    site["name"],
-                    (
-                        site["longitude"],
-                        site["latitude"]
-                    ),
-                    xytext=(6, 6),
-                    textcoords="offset points",
-                    fontsize=8,
-                    color="white",
-                    bbox=dict(
-                        boxstyle="round,pad=0.2",
-                        facecolor="black",
-                        alpha=0.6,
-                    ),
-                    zorder=11,
-                )
+        #         ax.annotate(
+        #             site["name"],
+        #             (
+        #                 site["longitude"],
+        #                 site["latitude"]
+        #             ),
+        #             xytext=(6, 6),
+        #             textcoords="offset points",
+        #             fontsize=8,
+        #             color="white",
+        #             bbox=dict(
+        #                 boxstyle="round,pad=0.2",
+        #                 facecolor="black",
+        #                 alpha=0.6,
+        #             ),
+        #             zorder=11,
+        #         )
 
-    ax.set_title(
-        "NetMonitor – Signalstärke"
-    )
+    # ax.set_title(
+    #     "NetMonitor – Signalstärke"
+    # )
 
     fig.tight_layout()
 
@@ -1396,109 +1373,109 @@ def plot_cell_changes(
         ax.scatter(
             changes["longitude"],
             changes["latitude"],
-            marker="*",
-            s=180,
+            marker="x",
+            s=100,
             color="orange",
             edgecolor="black",
             linewidth=1,
             zorder=10,
-            label="Cell-Wechsel",
+            label="Cell change",
         )
 
-        for _, row in changes.iterrows():
+        # for _, row in changes.iterrows():
 
-            ax.annotate(
-                str(row["cell_id"]),
-                (
-                    row["longitude"],
-                    row["latitude"]
-                ),
-                xytext=(7, 7),
-                textcoords="offset points",
-                fontsize=8,
-                color="black",
-                bbox=dict(
-                    boxstyle="round,pad=0.2",
-                    facecolor="white",
-                    alpha=0.8,
-                ),
-                zorder=11,
-            )
+        #     ax.annotate(
+        #         str(row["cell_id"]),
+        #         (
+        #             row["longitude"],
+        #             row["latitude"]
+        #         ),
+        #         xytext=(7, 7),
+        #         textcoords="offset points",
+        #         fontsize=8,
+        #         color="black",
+        #         bbox=dict(
+        #             boxstyle="round,pad=0.2",
+        #             facecolor="white",
+        #             alpha=0.8,
+        #         ),
+        #         zorder=11,
+        #     )
 
     # --------------------------------------------------------
     # Connection Lost
     # --------------------------------------------------------
 
-    lost = clf[
-        clf["connection_lost"]
-        & clf["has_position"]
-    ]
+    # lost = clf[
+    #     clf["connection_lost"]
+    #     & clf["has_position"]
+    # ]
 
-    if not lost.empty:
+    # if not lost.empty:
 
-        ax.scatter(
-            lost["longitude"],
-            lost["latitude"],
-            marker="x",
-            s=130,
-            color="red",
-            linewidth=2.5,
-            zorder=12,
-            label="Verbindung verloren",
-        )
+    #     ax.scatter(
+    #         lost["longitude"],
+    #         lost["latitude"],
+    #         marker="x",
+    #         s=130,
+    #         color="red",
+    #         linewidth=2.5,
+    #         zorder=12,
+    #         label="Verbindung verloren",
+    #     )
 
     # --------------------------------------------------------
     # Connection Restored
     # --------------------------------------------------------
 
-    restored = clf[
-        clf["connection_restored"]
-        & clf["has_position"]
-    ]
+    # restored = clf[
+    #     clf["connection_restored"]
+    #     & clf["has_position"]
+    # ]
 
-    if not restored.empty:
+    # if not restored.empty:
 
-        ax.scatter(
-            restored["longitude"],
-            restored["latitude"],
-            marker="o",
-            s=80,
-            facecolors="none",
-            edgecolors="green",
-            linewidth=2,
-            zorder=11,
-            label="Verbindung wiederhergestellt",
-        )
+    #     ax.scatter(
+    #         restored["longitude"],
+    #         restored["latitude"],
+    #         marker="o",
+    #         s=80,
+    #         facecolors="none",
+    #         edgecolors="green",
+    #         linewidth=2,
+    #         zorder=11,
+    #         label="Verbindung wiederhergestellt",
+    #     )
 
     # --------------------------------------------------------
     # KML CELL changes
     # --------------------------------------------------------
 
-    kml_changes = [
-        x for x in kml.get(
-            "changes",
-            []
-        )
-        if x["change_type"].upper() == "CELL"
-    ]
+    # kml_changes = [
+    #     x for x in kml.get(
+    #         "changes",
+    #         []
+    #     )
+    #     if x["change_type"].upper() == "CELL"
+    # ]
 
-    if kml_changes:
+    # if kml_changes:
 
-        ax.scatter(
-            [x["longitude"] for x in kml_changes],
-            [x["latitude"] for x in kml_changes],
-            marker="D",
-            s=55,
-            color="cyan",
-            edgecolor="black",
-            linewidth=0.7,
-            zorder=13,
-            label="KML CELL Change",
-        )
+    #     ax.scatter(
+    #         [x["longitude"] for x in kml_changes],
+    #         [x["latitude"] for x in kml_changes],
+    #         marker="D",
+    #         s=10,
+    #         color="cyan",
+    #         edgecolor="black",
+    #         linewidth=0.7,
+    #         zorder=13,
+    #         label="Cell change",
+    #     )
 
-    ax.set_title(
-        "NetMonitor – Zellwechsel und Verbindungsverluste"
-    )
+    # ax.set_title(
+    #     "NetMonitor – Zellwechsel und Verbindungsverluste"
+    # )
 
     handles, labels = ax.get_legend_handles_labels()
 
@@ -1525,417 +1502,417 @@ def plot_cell_changes(
 # SIGNAL TIME
 # ============================================================
 
-def plot_signal_time(
-    clf,
-    output_path,
-):
-    """Signalstärke über der Zeit."""
-
-    fig, ax = plt.subplots(
-        figsize=FIGSIZE,
-        dpi=DPI
-    )
-
-    data = clf[
-        clf["signal_dbm"].notna()
-    ].copy()
-
-    if data.empty:
-
-        ax.text(
-            0.5,
-            0.5,
-            "Keine Signalwerte vorhanden.",
-            ha="center",
-            va="center",
-            transform=ax.transAxes,
-        )
-
-    else:
-
-        ax.plot(
-            data["timestamp"],
-            data["signal_dbm"],
-            linewidth=1.2,
-            color="black",
-        )
-
-        ax.scatter(
-            data["timestamp"],
-            data["signal_dbm"],
-            c=data["signal_dbm"],
-            cmap=signal_color_map(),
-            norm=Normalize(
-                vmin=SIGNAL_VMIN,
-                vmax=SIGNAL_VMAX
-            ),
-            s=10,
-            zorder=3,
-        )
-
-        # Cell changes
-        changes = clf[
-            clf["cell_change"]
-            & clf["signal_dbm"].notna()
-        ]
-
-        if not changes.empty:
-
-            ax.scatter(
-                changes["timestamp"],
-                changes["signal_dbm"],
-                marker="*",
-                s=130,
-                color="orange",
-                edgecolor="black",
-                zorder=10,
-            )
-
-        ax.set_ylabel(
-            "Signal [dBm]"
-        )
-
-        ax.set_xlabel(
-            "Zeit"
-        )
-
-        ax.grid(
-            True,
-            alpha=0.3
-        )
-
-    ax.set_title(
-        "NetMonitor – Signalstärke über Zeit"
-    )
-
-    fig.autofmt_xdate()
-
-    fig.tight_layout()
-
-    fig.savefig(
-        output_path,
-        dpi=DPI,
-        bbox_inches="tight"
-    )
-
-    plt.close(fig)
-
-
-# ============================================================
-# SIGNAL PRO CELL
-# ============================================================
-
-def plot_signal_by_cell(
-    clf,
-    output_path,
-):
-    """Signalverteilung pro Cell ID."""
-
-    fig, ax = plt.subplots(
-        figsize=FIGSIZE,
-        dpi=DPI
-    )
-
-    data = clf[
-        clf["connected"]
-        & clf["signal_dbm"].notna()
-    ].copy()
-
-    if data.empty:
-
-        ax.text(
-            0.5,
-            0.5,
-            "Keine Signalwerte vorhanden.",
-            ha="center",
-            va="center",
-            transform=ax.transAxes,
-        )
-
-    else:
-
-        groups = []
-
-        labels = []
-
-        for cell_id, group in data.groupby(
-            "cell_id"
-        ):
+# def plot_signal_time(
+#     clf,
+#     output_path,
+# ):
+#     """Signalstärke über der Zeit."""
+
+#     fig, ax = plt.subplots(
+#         figsize=FIGSIZE,
+#         dpi=DPI
+#     )
+
+#     data = clf[
+#         clf["signal_dbm"].notna()
+#     ].copy()
+
+#     if data.empty:
+
+#         ax.text(
+#             0.5,
+#             0.5,
+#             "Keine Signalwerte vorhanden.",
+#             ha="center",
+#             va="center",
+#             transform=ax.transAxes,
+#         )
+
+#     else:
+
+#         ax.plot(
+#             data["timestamp"],
+#             data["signal_dbm"],
+#             linewidth=1.2,
+#             color="black",
+#         )
+
+#         ax.scatter(
+#             data["timestamp"],
+#             data["signal_dbm"],
+#             c=data["signal_dbm"],
+#             cmap=signal_color_map(),
+#             norm=Normalize(
+#                 vmin=SIGNAL_VMIN,
+#                 vmax=SIGNAL_VMAX
+#             ),
+#             s=10,
+#             zorder=3,
+#         )
+
+#         # Cell changes
+#         changes = clf[
+#             clf["cell_change"]
+#             & clf["signal_dbm"].notna()
+#         ]
+
+#         if not changes.empty:
+
+#             ax.scatter(
+#                 changes["timestamp"],
+#                 changes["signal_dbm"],
+#                 marker="*",
+#                 s=130,
+#                 color="orange",
+#                 edgecolor="black",
+#                 zorder=10,
+#             )
+
+#         ax.set_ylabel(
+#             "Signal [dBm]"
+#         )
+
+#         ax.set_xlabel(
+#             "Zeit"
+#         )
+
+#         ax.grid(
+#             True,
+#             alpha=0.3
+#         )
+
+#     ax.set_title(
+#         "NetMonitor – Signalstärke über Zeit"
+#     )
+
+#     fig.autofmt_xdate()
+
+#     fig.tight_layout()
+
+#     fig.savefig(
+#         output_path,
+#         dpi=DPI,
+#         bbox_inches="tight"
+#     )
+
+#     plt.close(fig)
+
+
+# # ============================================================
+# # SIGNAL PRO CELL
+# # ============================================================
+
+# def plot_signal_by_cell(
+#     clf,
+#     output_path,
+# ):
+#     """Signalverteilung pro Cell ID."""
+
+#     fig, ax = plt.subplots(
+#         figsize=FIGSIZE,
+#         dpi=DPI
+#     )
+
+#     data = clf[
+#         clf["connected"]
+#         & clf["signal_dbm"].notna()
+#     ].copy()
+
+#     if data.empty:
+
+#         ax.text(
+#             0.5,
+#             0.5,
+#             "Keine Signalwerte vorhanden.",
+#             ha="center",
+#             va="center",
+#             transform=ax.transAxes,
+#         )
+
+#     else:
+
+#         groups = []
+
+#         labels = []
+
+#         for cell_id, group in data.groupby(
+#             "cell_id"
+#         ):
 
-            values = group[
-                "signal_dbm"
-            ].dropna().values
+#             values = group[
+#                 "signal_dbm"
+#             ].dropna().values
 
-            if len(values) == 0:
-                continue
+#             if len(values) == 0:
+#                 continue
 
-            groups.append(values)
-            labels.append(str(cell_id))
-
-        if groups:
+#             groups.append(values)
+#             labels.append(str(cell_id))
+
+#         if groups:
 
-            bp = ax.boxplot(
-                groups,
-                patch_artist=False,
-            )
+#             bp = ax.boxplot(
+#                 groups,
+#                 patch_artist=False,
+#             )
 
-            ax.set_xticks(
-                range(1, len(labels) + 1)
-            )
-
-            ax.set_xticklabels(
-                labels,
-                rotation=45,
-                ha="right"
-            )
+#             ax.set_xticks(
+#                 range(1, len(labels) + 1)
+#             )
+
+#             ax.set_xticklabels(
+#                 labels,
+#                 rotation=45,
+#                 ha="right"
+#             )
 
-            ax.set_ylabel(
-                "Signal [dBm]"
-            )
+#             ax.set_ylabel(
+#                 "Signal [dBm]"
+#             )
 
-            ax.grid(
-                axis="y",
-                alpha=0.3
-            )
-
-        else:
-
-            ax.text(
-                0.5,
-                0.5,
-                "Keine Signalwerte vorhanden.",
-                ha="center",
-                va="center",
-                transform=ax.transAxes,
-            )
-
-    ax.set_title(
-        "NetMonitor – Signalverteilung pro Cell ID"
-    )
-
-    fig.tight_layout()
-
-    fig.savefig(
-        output_path,
-        dpi=DPI,
-        bbox_inches="tight"
-    )
-
-    plt.close(fig)
-
-
-# ============================================================
-# SUMMARY
-# ============================================================
-
-def make_summary(
-    clf,
-    kml,
-    output_path,
-):
-    """Erzeugt eine Zusammenfassung als PNG."""
-
-    fig = plt.figure(
-        figsize=FIGSIZE,
-        dpi=DPI
-    )
-
-    ax = fig.add_subplot(
-        111
-    )
-
-    ax.axis(
-        "off"
-    )
-
-    total = len(clf)
-
-    positions = int(
-        clf["has_position"].sum()
-    )
-
-    connected = int(
-        clf["connected"].sum()
-    )
-
-    no_connection = total - connected
-
-    cell_changes = int(
-        clf["cell_change"].sum()
-    )
-
-    connection_lost = int(
-        clf["connection_lost"].sum()
-    )
-
-    restored = int(
-        clf["connection_restored"].sum()
-    )
-
-    signal = clf[
-        "signal_dbm"
-    ].dropna()
-
-    if len(signal):
-
-        signal_min = signal.min()
-        signal_max = signal.max()
-        signal_mean = signal.mean()
-        signal_median = signal.median()
-
-    else:
-
-        signal_min = np.nan
-        signal_max = np.nan
-        signal_mean = np.nan
-        signal_median = np.nan
-
-    cells = (
-        clf.loc[
-            clf["connected"],
-            "cell_id"
-        ]
-        .value_counts()
-    )
-
-    start_time = clf[
-        "timestamp"
-    ].min()
-
-    end_time = clf[
-        "timestamp"
-    ].max()
-
-    duration = (
-        end_time - start_time
-    )
-
-    # --------------------------------------------------------
-    # Text
-    # --------------------------------------------------------
-
-    lines = [
-        "NetMonitor Analyse",
-        "",
-        f"Zeitraum:",
-        f"  {start_time} – {end_time}",
-        f"  Dauer: {duration}",
-        "",
-        f"Datensätze:           {total}",
-        f"GPS-Positionen:       {positions}",
-        f"Verbunden:             {connected}",
-        f"Keine Verbindung:     {no_connection}",
-        "",
-        f"Zellwechsel:           {cell_changes}",
-        f"Verbindungsverluste:   {connection_lost}",
-        f"Wieder verbunden:      {restored}",
-        "",
-        "Signal:",
-        f"  Minimum:             {signal_min:.1f} dBm"
-        if not pd.isna(signal_min)
-        else "  Minimum:             -",
-        f"  Maximum:             {signal_max:.1f} dBm"
-        if not pd.isna(signal_max)
-        else "  Maximum:             -",
-        f"  Mittelwert:          {signal_mean:.1f} dBm"
-        if not pd.isna(signal_mean)
-        else "  Mittelwert:          -",
-        f"  Median:              {signal_median:.1f} dBm"
-        if not pd.isna(signal_median)
-        else "  Median:              -",
-        "",
-        f"KML GPS-Punkte:        {len(kml.get('route', []))}",
-        f"KML Zellstandorte:     {len(kml.get('cell_sites', []))}",
-        f"KML Änderungen:        {len(kml.get('changes', []))}",
-        "",
-        "Cell IDs:",
-    ]
-
-    for cell_id, count in cells.items():
-
-        lines.append(
-            f"  {cell_id}: {count} Messungen"
-        )
-
-    ax.text(
-        0.05,
-        0.95,
-        "\n".join(lines),
-        transform=ax.transAxes,
-        verticalalignment="top",
-        fontsize=12,
-        family="monospace",
-    )
-
-    ax.set_title(
-        "NetMonitor – Zusammenfassung",
-        fontsize=18,
-        pad=20,
-    )
-
-    fig.tight_layout()
-
-    fig.savefig(
-        output_path,
-        dpi=DPI,
-        bbox_inches="tight"
-    )
-
-    plt.close(fig)
-
-
-# ============================================================
-# PDF
-# ============================================================
-
-def create_pdf(
-    image_paths,
-    output_path,
-):
-    """Erzeugt einen gemeinsamen PDF-Bericht."""
-
-    print(
-        f"Erzeuge PDF: {output_path}"
-    )
-
-    with PdfPages(
-        output_path
-    ) as pdf:
-
-        for image_path in image_paths:
-
-            if not Path(
-                image_path
-            ).exists():
-
-                continue
-
-            image = plt.imread(
-                image_path
-            )
-
-            fig = plt.figure(
-                figsize=FIGSIZE
-            )
-
-            ax = fig.add_axes(
-                [0, 0, 1, 1]
-            )
-
-            ax.imshow(
-                image
-            )
-
-            ax.axis(
-                "off"
-            )
-
-            pdf.savefig(
-                fig,
-                dpi=DPI
-            )
-
-            plt.close(fig)
+#             ax.grid(
+#                 axis="y",
+#                 alpha=0.3
+#             )
+
+#         else:
+
+#             ax.text(
+#                 0.5,
+#                 0.5,
+#                 "Keine Signalwerte vorhanden.",
+#                 ha="center",
+#                 va="center",
+#                 transform=ax.transAxes,
+#             )
+
+#     ax.set_title(
+#         "NetMonitor – Signalverteilung pro Cell ID"
+#     )
+
+#     fig.tight_layout()
+
+#     fig.savefig(
+#         output_path,
+#         dpi=DPI,
+#         bbox_inches="tight"
+#     )
+
+#     plt.close(fig)
+
+
+# # ============================================================
+# # SUMMARY
+# # ============================================================
+
+# def make_summary(
+#     clf,
+#     kml,
+#     output_path,
+# ):
+#     """Erzeugt eine Zusammenfassung als PNG."""
+
+#     fig = plt.figure(
+#         figsize=FIGSIZE,
+#         dpi=DPI
+#     )
+
+#     ax = fig.add_subplot(
+#         111
+#     )
+
+#     ax.axis(
+#         "off"
+#     )
+
+#     total = len(clf)
+
+#     positions = int(
+#         clf["has_position"].sum()
+#     )
+
+#     connected = int(
+#         clf["connected"].sum()
+#     )
+
+#     no_connection = total - connected
+
+#     cell_changes = int(
+#         clf["cell_change"].sum()
+#     )
+
+#     connection_lost = int(
+#         clf["connection_lost"].sum()
+#     )
+
+#     restored = int(
+#         clf["connection_restored"].sum()
+#     )
+
+#     signal = clf[
+#         "signal_dbm"
+#     ].dropna()
+
+#     if len(signal):
+
+#         signal_min = signal.min()
+#         signal_max = signal.max()
+#         signal_mean = signal.mean()
+#         signal_median = signal.median()
+
+#     else:
+
+#         signal_min = np.nan
+#         signal_max = np.nan
+#         signal_mean = np.nan
+#         signal_median = np.nan
+
+#     cells = (
+#         clf.loc[
+#             clf["connected"],
+#             "cell_id"
+#         ]
+#         .value_counts()
+#     )
+
+#     start_time = clf[
+#         "timestamp"
+#     ].min()
+
+#     end_time = clf[
+#         "timestamp"
+#     ].max()
+
+#     duration = (
+#         end_time - start_time
+#     )
+
+#     # --------------------------------------------------------
+#     # Text
+#     # --------------------------------------------------------
+
+#     lines = [
+#         "NetMonitor Analyse",
+#         "",
+#         f"Zeitraum:",
+#         f"  {start_time} – {end_time}",
+#         f"  Dauer: {duration}",
+#         "",
+#         f"Datensätze:           {total}",
+#         f"GPS-Positionen:       {positions}",
+#         f"Verbunden:             {connected}",
+#         f"Keine Verbindung:     {no_connection}",
+#         "",
+#         f"Zellwechsel:           {cell_changes}",
+#         f"Verbindungsverluste:   {connection_lost}",
+#         f"Wieder verbunden:      {restored}",
+#         "",
+#         "Signal:",
+#         f"  Minimum:             {signal_min:.1f} dBm"
+#         if not pd.isna(signal_min)
+#         else "  Minimum:             -",
+#         f"  Maximum:             {signal_max:.1f} dBm"
+#         if not pd.isna(signal_max)
+#         else "  Maximum:             -",
+#         f"  Mittelwert:          {signal_mean:.1f} dBm"
+#         if not pd.isna(signal_mean)
+#         else "  Mittelwert:          -",
+#         f"  Median:              {signal_median:.1f} dBm"
+#         if not pd.isna(signal_median)
+#         else "  Median:              -",
+#         "",
+#         f"KML GPS-Punkte:        {len(kml.get('route', []))}",
+#         f"KML Zellstandorte:     {len(kml.get('cell_sites', []))}",
+#         f"KML Änderungen:        {len(kml.get('changes', []))}",
+#         "",
+#         "Cell IDs:",
+#     ]
+
+#     for cell_id, count in cells.items():
+
+#         lines.append(
+#             f"  {cell_id}: {count} Messungen"
+#         )
+
+#     ax.text(
+#         0.05,
+#         0.95,
+#         "\n".join(lines),
+#         transform=ax.transAxes,
+#         verticalalignment="top",
+#         fontsize=12,
+#         family="monospace",
+#     )
+
+#     ax.set_title(
+#         "NetMonitor – Zusammenfassung",
+#         fontsize=18,
+#         pad=20,
+#     )
+
+#     fig.tight_layout()
+
+#     fig.savefig(
+#         output_path,
+#         dpi=DPI,
+#         bbox_inches="tight"
+#     )
+
+#     plt.close(fig)
+
+
+# # ============================================================
+# # PDF
+# # ============================================================
+
+# def create_pdf(
+#     image_paths,
+#     output_path,
+# ):
+#     """Erzeugt einen gemeinsamen PDF-Bericht."""
+
+#     print(
+#         f"Erzeuge PDF: {output_path}"
+#     )
+
+#     with PdfPages(
+#         output_path
+#     ) as pdf:
+
+#         for image_path in image_paths:
+
+#             if not Path(
+#                 image_path
+#             ).exists():
+
+#                 continue
+
+#             image = plt.imread(
+#                 image_path
+#             )
+
+#             fig = plt.figure(
+#                 figsize=FIGSIZE
+#             )
+
+#             ax = fig.add_axes(
+#                 [0, 0, 1, 1]
+#             )
+
+#             ax.imshow(
+#                 image
+#             )
+
+#             ax.axis(
+#                 "off"
+#             )
+
+#             pdf.savefig(
+#                 fig,
+#                 dpi=DPI
+#             )
+
+#             plt.close(fig)
 
 
 # ============================================================
@@ -2120,59 +2097,59 @@ def main():
             "Kartenplots werden übersprungen."
         )
 
-    # --------------------------------------------------------
-    # Signal Zeit
-    # --------------------------------------------------------
+    # # --------------------------------------------------------
+    # # Signal Zeit
+    # # --------------------------------------------------------
 
-    path = output_dir / "04_signal_time.png"
+    # path = output_dir / "04_signal_time.png"
 
-    plot_signal_time(
-        clf,
-        path
-    )
+    # plot_signal_time(
+    #     clf,
+    #     path
+    # )
 
-    image_paths.append(path)
+    # image_paths.append(path)
 
-    # --------------------------------------------------------
-    # Signal pro Cell
-    # --------------------------------------------------------
+    # # --------------------------------------------------------
+    # # Signal pro Cell
+    # # --------------------------------------------------------
 
-    path = output_dir / "05_signal_by_cell.png"
+    # path = output_dir / "05_signal_by_cell.png"
 
-    plot_signal_by_cell(
-        clf,
-        path
-    )
+    # plot_signal_by_cell(
+    #     clf,
+    #     path
+    # )
 
-    image_paths.append(path)
+    # image_paths.append(path)
 
-    # --------------------------------------------------------
-    # Summary
-    # --------------------------------------------------------
+    # # --------------------------------------------------------
+    # # Summary
+    # # --------------------------------------------------------
 
-    path = output_dir / "06_summary.png"
+    # path = output_dir / "06_summary.png"
 
-    make_summary(
-        clf,
-        kml,
-        path
-    )
+    # make_summary(
+    #     clf,
+    #     kml,
+    #     path
+    # )
 
-    image_paths.append(path)
+    # image_paths.append(path)
 
-    # --------------------------------------------------------
-    # PDF
-    # --------------------------------------------------------
+    # # --------------------------------------------------------
+    # # PDF
+    # # --------------------------------------------------------
 
-    pdf_path = (
-        output_dir /
-        "NetMonitor_Report.pdf"
-    )
+    # pdf_path = (
+    #     output_dir /
+    #     "NetMonitor_Report.pdf"
+    # )
 
-    create_pdf(
-        image_paths,
-        pdf_path
-    )
+    # create_pdf(
+    #     image_paths,
+    #     pdf_path
+    # )
 
     # --------------------------------------------------------
     # Fertig
@@ -2194,9 +2171,9 @@ def main():
             f"  {path.name}"
         )
 
-    print(
-        f"  {pdf_path.name}"
-    )
+    # print(
+    #     f"  {pdf_path.name}"
+    # )
 
     print()
 
